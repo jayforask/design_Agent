@@ -19,17 +19,10 @@ _BASE_URL = "https://api.bannerbear.com/v2"
 _POLL_INTERVAL = 3   # saniye
 _MAX_RETRIES = 15    # maksimum bekleme döngüsü (~45 saniye)
 
-# Cloudflare'i geçmek için gerçekçi tarayıcı header'ları
+# API istekleri için header'lar — Accept-Encoding yok, httpx kendi decompress eder
 _DEFAULT_HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/125.0.0.0 Safari/537.36"
-    ),
-    "Accept": "application/json, text/plain, */*",
-    "Accept-Language": "en-US,en;q=0.9",
-    "Accept-Encoding": "gzip, deflate, br",
-    "Connection": "keep-alive",
+    "User-Agent": "DesignX-TelegramBot/1.0",
+    "Accept": "application/json",
 }
 
 
