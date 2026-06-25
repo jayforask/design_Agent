@@ -12,6 +12,9 @@ Komutlar:
   /icerik   - İçerik üretimi modu
   /tablolar - Yüklü tabloları listele
   /tablosil - Tablo sil
+  /takip    - Yeni emlak ilanı takibi başlat
+  /takipler - Aktif takipleri listele
+  /takipsil - Takibi durdur
 """
 
 import logging
@@ -21,10 +24,11 @@ import os
 # Proje kökünü Python yoluna ekle
 sys.path.insert(0, os.path.dirname(__file__))
 
-from telegram import Update, BotCommand
+from telegram import Update, BotCommand, ReplyKeyboardMarkup, ReplyKeyboardRemove
 from telegram.ext import (
     Application,
     CommandHandler,
+    ConversationHandler,
     MessageHandler,
     filters,
     ContextTypes,
@@ -33,7 +37,11 @@ from telegram.ext import (
 import config
 import gemini_client as gemini
 import memory as mem
-from agents import video_agent, graphic_agent, content_agent, bannerbear_agent, table_agent
+from agents import (
+    video_agent, graphic_agent, content_agent,
+    bannerbear_agent, table_agent,
+    listing_store, alert_agent,
+)
 
 # Loglama ayarları
 logging.basicConfig(
@@ -451,6 +459,260 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 
 # ---------------------------------------------------------------------------
+# Emlak ilan takip komut işleyicileri (ConversationHandler)
+# ---------------------------------------------------------------------------
+
+# ConversationHandler adım sabitleri
+(
+    TAKIP_SEHIR,
+    TAKIP_TIP,
+    TAKIP_ODA,
+    TAKIP_FIYAT,
+    TAKIP_SAHIP,
+    TAKIP_ONAYLA,
+) = range(6)
+
+
+async def cmd_takip_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """/takip — İlan takibi başlatır, şehir/ilçe sorar."""
+    user = update.effective_user
+    if not is_allowed(user.id):
+        return ConversationHandler.END
+
+    context.user_data["takip"] = {}
+    await update.message.reply_text(
+        "🏠 *Yeni İlan Takibi*\n\n"
+        "Takip etmek istediğin şehir ve ilçeyi yaz.\n"
+        "Örnek: `Antalya Konyaaltı` veya sadece `Antalya`\n\n"
+        "_İptal için /iptal_",
+        parse_mode="Markdown",
+        reply_markup=ReplyKeyboardRemove(),
+    )
+    return TAKIP_SEHIR
+
+
+async def takip_sehir(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Şehir/ilçe alır, ilan tipi sorar."""
+    text = update.message.text.strip()
+    parts = text.split(None, 1)
+    context.user_data["takip"]["city"] = parts[0]
+    context.user_data["takip"]["district"] = parts[1] if len(parts) > 1 else ""
+
+    keyboard = [["🔑 Kiralık", "💰 Satılık"]]
+    await update.message.reply_text(
+        f"📍 *{text}* seçildi.\n\nNe arıyorsun?",
+        parse_mode="Markdown",
+        reply_markup=ReplyKeyboardMarkup(keyboard, one_time_keyboard=True, resize_keyboard=True),
+    )
+    return TAKIP_TIP
+
+
+async def takip_tip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Kiralık/Satılık alır, oda sayısı sorar."""
+    text = update.message.text.strip().lower()
+    listing_type = "satilik" if "satılık" in text or "satilik" in text else "kiralik"
+    context.user_data["takip"]["listing_type"] = listing_type
+
+    keyboard = [["1+1", "2+1", "3+1"], ["4+1", "5+1", "🔀 Tümü"]]
+    await update.message.reply_text(
+        "🛏 Oda sayısı? (Birden fazla seçmek için virgülle yaz: `2+1, 3+1`)\n"
+        "Ya da düğmelerden birini seç:",
+        parse_mode="Markdown",
+        reply_markup=ReplyKeyboardMarkup(keyboard, one_time_keyboard=True, resize_keyboard=True),
+    )
+    return TAKIP_ODA
+
+
+async def takip_oda(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Oda sayısı alır, fiyat aralığı sorar."""
+    text = update.message.text.strip()
+    if "tüm" in text.lower() or text == "🔀 Tümü":
+        room_types = []
+    else:
+        # "2+1, 3+1" veya "3+1" formatını parse et
+        room_types = [r.strip() for r in text.replace("🛏", "").split(",") if r.strip()]
+        # Geçersiz formatları temizle (sadece N+N formatı)
+        import re as _re
+        room_types = [r for r in room_types if _re.match(r"^\d+\+\d+$", r)]
+
+    context.user_data["takip"]["room_types"] = room_types
+
+    keyboard = [["⏭ Atla"]]
+    await update.message.reply_text(
+        "💰 Fiyat aralığı? (min-max, örn: `5000-15000`)\n"
+        "Filtrelemek istemiyorsan *Atla*'ya bas.",
+        parse_mode="Markdown",
+        reply_markup=ReplyKeyboardMarkup(keyboard, one_time_keyboard=True, resize_keyboard=True),
+    )
+    return TAKIP_FIYAT
+
+
+async def takip_fiyat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Fiyat aralığı alır, sahibinden filtresi sorar."""
+    text = update.message.text.strip()
+    min_price = max_price = None
+
+    if "atla" not in text.lower() and text != "⏭ Atla":
+        import re as _re
+        m = _re.search(r"(\d+)\D+(\d+)", text)
+        if m:
+            min_price = int(m.group(1))
+            max_price = int(m.group(2))
+        else:
+            single = _re.sub(r"\D", "", text)
+            if single:
+                max_price = int(single)
+
+    context.user_data["takip"]["min_price"] = min_price
+    context.user_data["takip"]["max_price"] = max_price
+
+    keyboard = [["👤 Sadece Sahibinden", "🏢 Hepsi (Emlakçı dahil)"]]
+    await update.message.reply_text(
+        "👤 İlanlar kimden gelsin?",
+        reply_markup=ReplyKeyboardMarkup(keyboard, one_time_keyboard=True, resize_keyboard=True),
+    )
+    return TAKIP_SAHIP
+
+
+async def takip_sahip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Sahibinden filtresi alır, özet gösterir."""
+    text = update.message.text.strip().lower()
+    owner_only = "emlakçı" not in text and "hepsi" not in text
+
+    td = context.user_data["takip"]
+    td["owner_only"] = owner_only
+
+    city = td.get("city", "")
+    district = td.get("district", "")
+    listing_type = td.get("listing_type", "kiralik")
+    room_types = td.get("room_types", [])
+    min_p = td.get("min_price")
+    max_p = td.get("max_price")
+
+    rooms_str = ", ".join(room_types) if room_types else "Tümü"
+    price_str = ""
+    if min_p or max_p:
+        lo = f"{min_p:,}" if min_p else "0"
+        hi = f"{max_p:,}" if max_p else "∞"
+        price_str = f"\n💰 Fiyat: {lo} – {hi} ₺"
+    owner_str = "👤 Sadece sahibinden" if owner_only else "🏢 Emlakçı dahil"
+
+    label = f"{city}{(' / ' + district) if district else ''} {listing_type.capitalize()}"
+    td["label"] = label
+
+    summary = (
+        f"📋 *Takip Özeti*\n\n"
+        f"📍 {city}{(' / ' + district) if district else ''}\n"
+        f"🏠 {listing_type.capitalize()}\n"
+        f"🛏 Oda: {rooms_str}{price_str}\n"
+        f"{owner_str}\n\n"
+        f"Her saat sahibinden.com, hepsiemlak.com ve emlakjet.com taranacak."
+    )
+
+    keyboard = [["✅ Onayla", "❌ İptal"]]
+    await update.message.reply_text(
+        summary,
+        parse_mode="Markdown",
+        reply_markup=ReplyKeyboardMarkup(keyboard, one_time_keyboard=True, resize_keyboard=True),
+    )
+    return TAKIP_ONAYLA
+
+
+async def takip_onayla(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Onay alır, watchlist kaydeder."""
+    text = update.message.text.strip().lower()
+    if "iptal" in text or "❌" in text:
+        await update.message.reply_text(
+            "❌ Takip iptal edildi.",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        context.user_data.pop("takip", None)
+        return ConversationHandler.END
+
+    user = update.effective_user
+    td = context.user_data.get("takip", {})
+
+    wl_id = listing_store.add_watchlist(
+        user_id=user.id,
+        label=td.get("label", "Takip"),
+        city=td.get("city", ""),
+        district=td.get("district", ""),
+        listing_type=td.get("listing_type", "kiralik"),
+        room_types=td.get("room_types", []),
+        min_price=td.get("min_price"),
+        max_price=td.get("max_price"),
+        owner_only=td.get("owner_only", True),
+    )
+
+    await update.message.reply_text(
+        f"✅ Takip #{wl_id} oluşturuldu!\n\n"
+        "Her saat kontrol edilecek, yeni ilan geldiğinde seni haberdar edeceğim 🔔\n\n"
+        "/takipler ile tüm takiplerine bakabilirsin.",
+        reply_markup=ReplyKeyboardRemove(),
+    )
+    logger.info("Watchlist oluşturuldu: #%d (user: %d)", wl_id, user.id)
+    context.user_data.pop("takip", None)
+    return ConversationHandler.END
+
+
+async def cmd_takip_iptal(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """/iptal — Aktif konuşmayı iptal eder."""
+    context.user_data.pop("takip", None)
+    await update.message.reply_text(
+        "❌ İptal edildi.", reply_markup=ReplyKeyboardRemove()
+    )
+    return ConversationHandler.END
+
+
+async def cmd_takipler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/takipler — Aktif takipleri listeler."""
+    user = update.effective_user
+    if not is_allowed(user.id):
+        return
+
+    watchlists = listing_store.list_watchlists(user.id)
+    text = listing_store.format_watchlist_list(watchlists)
+    await update.message.reply_text(text, parse_mode="Markdown")
+
+
+async def cmd_takipsil(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/takipsil <id> — Belirtilen takibi durdurur."""
+    user = update.effective_user
+    if not is_allowed(user.id):
+        return
+
+    if not context.args:
+        watchlists = listing_store.list_watchlists(user.id)
+        if not watchlists:
+            await update.message.reply_text(
+                "📭 Aktif takibiniz yok."
+            )
+            return
+        text = listing_store.format_watchlist_list(watchlists)
+        await update.message.reply_text(
+            f"Silmek istediğiniz takibin ID'sini yazın:\n\n{text}\n"
+            f"Örnek: `/takipsil {watchlists[0]['id']}`",
+            parse_mode="Markdown",
+        )
+        return
+
+    try:
+        wl_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("⚠️ Geçersiz ID. Örnek: `/takipsil 3`", parse_mode="Markdown")
+        return
+
+    success = listing_store.delete_watchlist(user.id, wl_id)
+    if success:
+        await update.message.reply_text(f"🗑️ Takip #{wl_id} durduruldu.")
+        logger.info("Watchlist silindi: #%d (user: %d)", wl_id, user.id)
+    else:
+        await update.message.reply_text(
+            f"⚠️ #{wl_id} numaralı takip bulunamadı.\n/takipler ile listeni kontrol et."
+        )
+
+
+# ---------------------------------------------------------------------------
 # Serbest mesaj işleyicisi (ajan yönlendirmesi)
 # ---------------------------------------------------------------------------
 
@@ -596,9 +858,30 @@ async def _send_long_message(update: Update, text: str) -> None:
 # ---------------------------------------------------------------------------
 
 async def post_init(app: Application) -> None:
-    """Bot komutlarını Telegram'a kaydet (menüde görünür)."""
+    """Bot komutlarını Telegram'a kaydet ve scheduler başlat."""
+    # Veritabanları başlat
     table_agent.init_db()
-    logger.info("Tablo veritabanı başlatıldı.")
+    listing_store.init_db()
+    logger.info("Veritabanları başlatıldı.")
+
+    # APScheduler — saatlik emlak taraması
+    try:
+        from apscheduler.schedulers.asyncio import AsyncIOScheduler
+        scheduler = AsyncIOScheduler(timezone="Europe/Istanbul")
+        scheduler.add_job(
+            alert_agent.run_scrape_cycle,
+            trigger="interval",
+            hours=1,
+            args=[app],
+            id="emlak_tarama",
+            name="Emlak İlan Taraması",
+            misfire_grace_time=300,
+        )
+        scheduler.start()
+        logger.info("APScheduler başlatıldı — saatlik emlak taraması aktif.")
+    except Exception as exc:
+        logger.error("APScheduler başlatılamadı: %s", exc)
+
     commands = [
         BotCommand("start", "Botu başlat"),
         BotCommand("help", "Yardım ve komutlar"),
@@ -609,6 +892,9 @@ async def post_init(app: Application) -> None:
         BotCommand("tasarim", "Görsel oluştur ve gönder"),
         BotCommand("tablolar", "Yüklü tabloları listele"),
         BotCommand("tablosil", "Tablo sil"),
+        BotCommand("takip", "Yeni emlak ilanı takibi başlat"),
+        BotCommand("takipler", "Aktif takipleri listele"),
+        BotCommand("takipsil", "Takibi durdur"),
         BotCommand("hakkimda", "Seni nasıl tanıdığımı göster"),
         BotCommand("reset", "Hafızayı sıfırla"),
     ]
@@ -634,6 +920,22 @@ def main() -> None:
         .build()
     )
 
+    # ConversationHandler — /takip adım adım kurulum
+    takip_conv = ConversationHandler(
+        entry_points=[CommandHandler("takip", cmd_takip_start)],
+        states={
+            TAKIP_SEHIR:  [MessageHandler(filters.TEXT & ~filters.COMMAND, takip_sehir)],
+            TAKIP_TIP:    [MessageHandler(filters.TEXT & ~filters.COMMAND, takip_tip)],
+            TAKIP_ODA:    [MessageHandler(filters.TEXT & ~filters.COMMAND, takip_oda)],
+            TAKIP_FIYAT:  [MessageHandler(filters.TEXT & ~filters.COMMAND, takip_fiyat)],
+            TAKIP_SAHIP:  [MessageHandler(filters.TEXT & ~filters.COMMAND, takip_sahip)],
+            TAKIP_ONAYLA: [MessageHandler(filters.TEXT & ~filters.COMMAND, takip_onayla)],
+        },
+        fallbacks=[CommandHandler("iptal", cmd_takip_iptal)],
+        allow_reentry=True,
+    )
+    app.add_handler(takip_conv)
+
     # Komut işleyicileri
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
@@ -646,6 +948,8 @@ def main() -> None:
     app.add_handler(CommandHandler("tasarim", cmd_tasarim))
     app.add_handler(CommandHandler("tablolar", cmd_tablolar))
     app.add_handler(CommandHandler("tablosil", cmd_tablosil))
+    app.add_handler(CommandHandler("takipler", cmd_takipler))
+    app.add_handler(CommandHandler("takipsil", cmd_takipsil))
 
     # Dosya (Excel/CSV) mesajları
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
