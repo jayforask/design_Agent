@@ -25,6 +25,8 @@ def _headers(api_key: str) -> dict:
     return {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
+        "User-Agent": "DesignX-Bot/1.0 (python-urllib)",
+        "Accept": "application/json",
     }
 
 
