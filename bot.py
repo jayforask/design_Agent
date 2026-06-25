@@ -3,13 +3,15 @@ DesignX Telegram Botu - Ana Giriş Noktası
 7/24 çalışır; kullanıcıyı tanır, öğrenir ve tasarım konularında yardımcı olur.
 
 Komutlar:
-  /start   - Botu başlat ve karşılama mesajı al
-  /help    - Yetenekler ve kullanım kılavuzu
-  /reset   - Hafızayı ve sohbet geçmişini sıfırla
+  /start    - Botu başlat ve karşılama mesajı al
+  /help     - Yetenekler ve kullanım kılavuzu
+  /reset    - Hafızayı ve sohbet geçmişini sıfırla
   /hakkimda - Botun seni nasıl tanıdığını göster
-  /video   - Video düzenleme modu
-  /grafik  - Grafik tasarım modu
-  /icerik  - İçerik üretimi modu
+  /video    - Video düzenleme modu
+  /grafik   - Grafik tasarım modu
+  /icerik   - İçerik üretimi modu
+  /tablolar - Yüklü tabloları listele
+  /tablosil - Tablo sil
 """
 
 import logging
@@ -31,7 +33,7 @@ from telegram.ext import (
 import config
 import gemini_client as gemini
 import memory as mem
-from agents import video_agent, graphic_agent, content_agent, bannerbear_agent
+from agents import video_agent, graphic_agent, content_agent, bannerbear_agent, table_agent
 
 # Loglama ayarları
 logging.basicConfig(
@@ -356,6 +358,99 @@ async def cmd_tasarim(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 
 # ---------------------------------------------------------------------------
+# Tablo analizi komut işleyicileri
+# ---------------------------------------------------------------------------
+
+async def cmd_tablolar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/tablolar — Kullanıcının yüklediği tabloları listeler."""
+    user = update.effective_user
+    if not is_allowed(user.id):
+        return
+
+    await update.message.chat.send_action("typing")
+    tables = table_agent.list_user_tables(user.id)
+    text = table_agent.format_table_list(tables)
+    await update.message.reply_text(text, parse_mode="Markdown")
+
+
+async def cmd_tablosil(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/tablosil <tablo_id> — Belirtilen tabloyu siler."""
+    user = update.effective_user
+    if not is_allowed(user.id):
+        return
+
+    if not context.args:
+        # Argüman verilmemişse mevcut tabloları listele
+        tables = table_agent.list_user_tables(user.id)
+        if not tables:
+            await update.message.reply_text(
+                "📭 Silinecek tablo yok.\n\nÖnce bir Excel veya CSV dosyası gönderin."
+            )
+            return
+        text = table_agent.format_table_list(tables)
+        await update.message.reply_text(
+            f"Silmek istediğiniz tablonun ID'sini yazın:\n\n{text}\n"
+            f"Örnek: `/tablosil {tables[0]['table_name']}`",
+            parse_mode="Markdown",
+        )
+        return
+
+    table_name = context.args[0]
+    success = table_agent.delete_table(user.id, table_name)
+
+    if success:
+        await update.message.reply_text(
+            f"🗑️ Tablo silindi: `{table_name}`", parse_mode="Markdown"
+        )
+        logger.info("Tablo silindi: %s (user: %d)", table_name, user.id)
+    else:
+        await update.message.reply_text(
+            f"⚠️ Tablo bulunamadı: `{table_name}`\n\n"
+            "Mevcut tablolarınız için /tablolar komutunu kullanın.",
+            parse_mode="Markdown",
+        )
+
+
+async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Excel/CSV dosyalarını alır, parse eder ve SQLite'a kaydeder."""
+    user = update.effective_user
+    if not is_allowed(user.id):
+        await update.message.reply_text("⛔ Bu bota erişim izniniz yok.")
+        return
+
+    doc = update.message.document
+    if not doc:
+        return
+
+    filename = doc.file_name or "dosya"
+    ext = "." + filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+
+    if ext not in table_agent.SUPPORTED_EXTENSIONS:
+        # Desteklenmeyen format — sessizce geç (fotoğraf/video gibi diğer dosyalar)
+        return
+
+    await update.message.chat.send_action("typing")
+    await update.message.reply_text(
+        f"📂 *{filename}* alındı, işleniyor...", parse_mode="Markdown"
+    )
+
+    try:
+        tg_file = await doc.get_file()
+        file_bytes = await tg_file.download_as_bytearray()
+        result = table_agent.parse_and_save(user.id, bytes(file_bytes), filename)
+        await update.message.reply_text(result["summary"], parse_mode="Markdown")
+        logger.info(
+            "Tablo yüklendi: %s → %s (%d satır, user: %d)",
+            filename, result["table_name"], result["row_count"], user.id,
+        )
+    except Exception as exc:
+        logger.error("Tablo yükleme hatası: %s", exc)
+        await update.message.reply_text(
+            f"⚠️ Dosya işlenemedi: `{str(exc)[:300]}`", parse_mode="Markdown"
+        )
+
+
+# ---------------------------------------------------------------------------
 # Serbest mesaj işleyicisi (ajan yönlendirmesi)
 # ---------------------------------------------------------------------------
 
@@ -427,6 +522,28 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             )
             return
 
+    # ── Tablo sorusu tespiti (table_agent entegrasyonu) ───────────────────────
+    if table_agent.detect_table_question(text):
+        latest = table_agent.get_latest_table(user.id)
+        if latest:
+            await update.message.chat.send_action("typing")
+            result = table_agent.query_with_gemini(
+                user.id, text, config.GEMINI_API_KEY, config.GEMINI_MODEL
+            )
+            await _send_long_message(update, result["answer"])
+            if result.get("chart_path"):
+                try:
+                    with open(result["chart_path"], "rb") as img:
+                        await update.message.reply_photo(
+                            photo=img,
+                            caption=f"📊 {result.get('chart_type', 'Grafik').capitalize()} grafiği",
+                        )
+                    import os as _os
+                    _os.unlink(result["chart_path"])
+                except Exception as exc:
+                    logger.error("Grafik gönderilemedi: %s", exc)
+            return
+
     # ── Normal ajan yönlendirmesi ─────────────────────────────────────────────
     skill = mem.load_memory(user.id).get("preferences", {}).get("skill_level", "orta")
 
@@ -480,6 +597,8 @@ async def _send_long_message(update: Update, text: str) -> None:
 
 async def post_init(app: Application) -> None:
     """Bot komutlarını Telegram'a kaydet (menüde görünür)."""
+    table_agent.init_db()
+    logger.info("Tablo veritabanı başlatıldı.")
     commands = [
         BotCommand("start", "Botu başlat"),
         BotCommand("help", "Yardım ve komutlar"),
@@ -488,6 +607,8 @@ async def post_init(app: Application) -> None:
         BotCommand("icerik", "İçerik üretimi sorusu sor"),
         BotCommand("sablonlar", "Bannerbear şablonlarını listele"),
         BotCommand("tasarim", "Görsel oluştur ve gönder"),
+        BotCommand("tablolar", "Yüklü tabloları listele"),
+        BotCommand("tablosil", "Tablo sil"),
         BotCommand("hakkimda", "Seni nasıl tanıdığımı göster"),
         BotCommand("reset", "Hafızayı sıfırla"),
     ]
@@ -523,6 +644,11 @@ def main() -> None:
     app.add_handler(CommandHandler("icerik", cmd_icerik))
     app.add_handler(CommandHandler("sablonlar", cmd_sablonlar))
     app.add_handler(CommandHandler("tasarim", cmd_tasarim))
+    app.add_handler(CommandHandler("tablolar", cmd_tablolar))
+    app.add_handler(CommandHandler("tablosil", cmd_tablosil))
+
+    # Dosya (Excel/CSV) mesajları
+    app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
 
     # Serbest metin mesajları
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
