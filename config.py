@@ -20,6 +20,10 @@ ALLOWED_USER_IDS: list[int] = [
 GEMINI_API_KEY: str = os.getenv("GEMINI_API_KEY", "")
 GEMINI_MODEL: str = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
 
+# Bannerbear API Ayarları
+BANNERBEAR_API_KEY: str = os.getenv("BANNERBEAR_API_KEY", "")
+BANNERBEAR_DEFAULT_TEMPLATE: str = os.getenv("BANNERBEAR_DEFAULT_TEMPLATE", "")
+
 # Ajan Kişiliği
 AGENT_NAME: str = "DesignX"
 AGENT_SYSTEM_PROMPT: str = (

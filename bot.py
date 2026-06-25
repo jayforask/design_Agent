@@ -31,7 +31,7 @@ from telegram.ext import (
 import config
 import gemini_client as gemini
 import memory as mem
-from agents import video_agent, graphic_agent, content_agent
+from agents import video_agent, graphic_agent, content_agent, bannerbear_agent
 
 # Loglama ayarları
 logging.basicConfig(
@@ -103,6 +103,9 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/video `<sorun>` — Video düzenleme\n"
         "/grafik `<sorun>` — Grafik tasarım\n"
         "/icerik `<sorun>` — İçerik üretimi\n\n"
+        "*Bannerbear Görsel Üretimi:*\n"
+        "/sablonlar — Mevcut şablonları listele\n"
+        "/tasarim `<sablon_uid> <katman:değer, ...>` — Görsel oluştur\n\n"
         "*Hafıza Komutları:*\n"
         "/hakkimda — Seni nasıl tanıdığımı göster\n"
         "/reset — Hafızamı ve geçmişi sıfırla\n\n"
@@ -226,6 +229,102 @@ async def cmd_icerik(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 
 # ---------------------------------------------------------------------------
+# Bannerbear komut işleyicileri
+# ---------------------------------------------------------------------------
+
+async def cmd_sablonlar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/sablonlar — Bannerbear hesabındaki şablonları listeler."""
+    user = update.effective_user
+    if not is_allowed(user.id):
+        return
+
+    if not config.BANNERBEAR_API_KEY:
+        await update.message.reply_text(
+            "⚠️ Bannerbear API anahtarı ayarlanmamış. "
+            "BANNERBEAR\\_API\\_KEY ortam değişkenini ekle.",
+            parse_mode="Markdown",
+        )
+        return
+
+    await update.message.chat.send_action("typing")
+    try:
+        templates = bannerbear_agent.list_templates(config.BANNERBEAR_API_KEY)
+        text = bannerbear_agent.format_template_list(templates)
+        await update.message.reply_text(text, parse_mode="Markdown")
+    except Exception as exc:
+        logger.error("Bannerbear şablon listesi hatası: %s", exc)
+        await update.message.reply_text("⚠️ Şablonlar alınamadı. API anahtarını kontrol et.")
+
+
+async def cmd_tasarim(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/tasarim <sablon_uid> <baslik: Metin, alt_baslik: Metin> — Görsel oluşturur ve gönderir."""
+    user = update.effective_user
+    if not is_allowed(user.id):
+        return
+
+    if not config.BANNERBEAR_API_KEY:
+        await update.message.reply_text(
+            "⚠️ Bannerbear API anahtarı ayarlanmamış. "
+            "BANNERBEAR\\_API\\_KEY ortam değişkenini ekle.",
+            parse_mode="Markdown",
+        )
+        return
+
+    args = context.args
+    # İlk arg şablon UID, geri kalanı modifikasyon promptu
+    if not args:
+        default_uid = config.BANNERBEAR_DEFAULT_TEMPLATE
+        if not default_uid:
+            await update.message.reply_text(
+                "📋 Kullanım:\n"
+                "`/tasarim <sablon_uid> baslik: Metin, alt_baslik: Alt Metin`\n\n"
+                "Mevcut şablonları görmek için /sablonlar komutunu kullan.",
+                parse_mode="Markdown",
+            )
+            return
+        template_uid = default_uid
+        prompt = ""
+    else:
+        template_uid = args[0]
+        prompt = " ".join(args[1:])
+
+    await update.message.chat.send_action("upload_photo")
+    await update.message.reply_text("🎨 Görsel oluşturuluyor, lütfen bekle...")
+
+    try:
+        # Şablon detaylarını al
+        template_info = bannerbear_agent.get_template(config.BANNERBEAR_API_KEY, template_uid)
+
+        # Prompttan modifikasyonları oluştur
+        if prompt:
+            modifications = bannerbear_agent.build_modifications_from_prompt(prompt, template_info)
+        else:
+            # Modifikasyon yoksa boş liste ile dene (varsayılan şablon değerleri kullanılır)
+            modifications = []
+
+        # Görseli oluştur ve URL'yi bekle
+        image_url = bannerbear_agent.generate_and_get_url(
+            config.BANNERBEAR_API_KEY, template_uid, modifications
+        )
+
+        # Telegram'a fotoğraf olarak gönder
+        await update.message.reply_photo(
+            photo=image_url,
+            caption=f"✅ Görsel hazır!\n🔗 [PNG İndir]({image_url})",
+            parse_mode="Markdown",
+        )
+        logger.info("Bannerbear görsel gönderildi: %s → %s", template_uid, user.id)
+
+    except Exception as exc:
+        logger.error("Bannerbear görsel oluşturma hatası: %s", exc)
+        await update.message.reply_text(
+            f"⚠️ Görsel oluşturulamadı:\n`{exc}`\n\n"
+            "Şablon UID'sini `/sablonlar` ile kontrol et.",
+            parse_mode="Markdown",
+        )
+
+
+# ---------------------------------------------------------------------------
 # Serbest mesaj işleyicisi (ajan yönlendirmesi)
 # ---------------------------------------------------------------------------
 
@@ -305,6 +404,8 @@ async def post_init(app: Application) -> None:
         BotCommand("video", "Video düzenleme sorusu sor"),
         BotCommand("grafik", "Grafik tasarım sorusu sor"),
         BotCommand("icerik", "İçerik üretimi sorusu sor"),
+        BotCommand("sablonlar", "Bannerbear şablonlarını listele"),
+        BotCommand("tasarim", "Görsel oluştur ve gönder"),
         BotCommand("hakkimda", "Seni nasıl tanıdığımı göster"),
         BotCommand("reset", "Hafızayı sıfırla"),
     ]
@@ -338,6 +439,8 @@ def main() -> None:
     app.add_handler(CommandHandler("video", cmd_video))
     app.add_handler(CommandHandler("grafik", cmd_grafik))
     app.add_handler(CommandHandler("icerik", cmd_icerik))
+    app.add_handler(CommandHandler("sablonlar", cmd_sablonlar))
+    app.add_handler(CommandHandler("tasarim", cmd_tasarim))
 
     # Serbest metin mesajları
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
