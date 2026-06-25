@@ -359,10 +359,28 @@ async def cmd_tasarim(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 # Serbest mesaj işleyicisi (ajan yönlendirmesi)
 # ---------------------------------------------------------------------------
 
+# Tasarım isteği anahtar kelimeleri
+_DESIGN_KEYWORDS = [
+    "görsel yap", "görsel oluştur", "tasarım yap", "banner yap", "banner oluştur",
+    "afiş yap", "poster yap", "resim yap", "resim oluştur", "görseli oluştur",
+    "görsel hazırla", "tasarla", "tasarım oluştur", "görsel çiz",
+    "görsel istiyorum", "tasarım istiyorum", "bana bir görsel",
+    "instagram görseli", "sosyal medya görseli", "reklam görseli",
+]
+
+
+def _detect_design_request(text: str) -> bool:
+    """Kullanıcı metninin görsel tasarım isteği olup olmadığını tespit eder."""
+    lower = text.lower()
+    return any(kw in lower for kw in _DESIGN_KEYWORDS)
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
     Serbest metin mesajlarını alır, konuyu otomatik tespit eder
     ve uygun ajan promptuyla Gemini'ye yönlendirir.
+
+    Tasarım isteği tespit edilirse Bannerbear ile görsel üretir.
     """
     user = update.effective_user
     if not is_allowed(user.id):
@@ -375,7 +393,41 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     await update.message.chat.send_action("typing")
 
-    # Konu tespiti — sırayla dene
+    # ── Tasarım isteği tespiti (Bannerbear entegrasyonu) ──────────────────────
+    if config.BANNERBEAR_API_KEY and _detect_design_request(text):
+        await update.message.chat.send_action("upload_photo")
+        await update.message.reply_text("🎨 Tasarım isteğin alındı, görsel oluşturuluyor...")
+        try:
+            templates = bannerbear_agent.list_templates(config.BANNERBEAR_API_KEY)
+            if templates:
+                design = bannerbear_agent.parse_design_intent_with_gemini(
+                    user_request=text,
+                    templates=templates,
+                    gemini_api_key=config.GEMINI_API_KEY,
+                    gemini_model=config.GEMINI_MODEL,
+                )
+                if design and design.get("template_uid"):
+                    image_url = bannerbear_agent.generate_and_get_url(
+                        config.BANNERBEAR_API_KEY,
+                        design["template_uid"],
+                        design.get("modifications", []),
+                    )
+                    await update.message.reply_photo(
+                        photo=image_url,
+                        caption=f"✅ Görsel hazır!\n🔗 [PNG İndir]({image_url})",
+                        parse_mode="Markdown",
+                    )
+                    mem.learn_fact(user.id, f"Görsel tasarım isteğinde bulundu: {text[:60]}")
+                    return
+        except Exception as exc:
+            logger.error("Bannerbear akıllı tasarım hatası: %s", exc)
+            await update.message.reply_text(
+                f"⚠️ Görsel oluşturulamadı: `{str(exc)[:200]}`",
+                parse_mode="Markdown",
+            )
+            return
+
+    # ── Normal ajan yönlendirmesi ─────────────────────────────────────────────
     skill = mem.load_memory(user.id).get("preferences", {}).get("skill_level", "orta")
 
     video_topic = video_agent.detect_video_topic(text)
@@ -393,7 +445,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         enriched = content_agent.build_content_prompt(text, platform=platform)
         mem.learn_fact(user.id, f"İçerik üretimiyle ilgileniyor: {content_topic} / {platform}")
     else:
-        # Konu tespit edilemezse direkt sor
         enriched = text
 
     try:

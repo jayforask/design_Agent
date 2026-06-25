@@ -9,6 +9,8 @@ import json
 import time
 import logging
 import httpx
+import urllib.request
+import urllib.error
 
 logger = logging.getLogger(__name__)
 
@@ -239,6 +241,97 @@ def _parse_user_prompt(prompt: str) -> dict[str, str]:
             if key and value:
                 result[key] = value
     return result
+
+
+def parse_design_intent_with_gemini(
+    user_request: str,
+    templates: list[dict],
+    gemini_api_key: str,
+    gemini_model: str,
+) -> dict | None:
+    """
+    Kullanıcının doğal dil isteğini Gemini ile analiz eder ve Bannerbear parametrelerine çevirir.
+
+    Args:
+        user_request: Kullanıcının serbest metin isteği
+        templates: Bannerbear şablon listesi (list_templates çıktısı)
+        gemini_api_key: Gemini API anahtarı
+        gemini_model: Kullanılacak Gemini modeli
+
+    Returns:
+        {
+            "template_uid": "...",
+            "modifications": [{"name": "...", "text": "..."}]
+        }
+        veya None (tasarım isteği değilse)
+    """
+    if not templates:
+        return None
+
+    # Gemini'ye gönderilecek prompt
+    template_info = "\n".join([
+        f"- {t['name']} (UID: {t['uid']})\n  Katmanlar: {', '.join([m['name'] for m in t.get('available_modifications', [])])}"
+        for t in templates[:3]  # İlk 3 şablon
+    ])
+
+    prompt = f"""Kullanıcı bir görsel tasarım istiyor. Aşağıdaki Bannerbear şablonlarından uygun olanı seç ve katman değerlerini belirle.
+
+ŞABLONLAR:
+{template_info}
+
+KULLANICI İSTEĞİ:
+"{user_request}"
+
+GÖREV:
+1. En uygun şablonu seç
+2. Katman adlarına göre değerleri belirle
+3. JSON formatında döndür
+
+ÇIKTI FORMATI (sadece JSON, başka metin yok):
+{{
+  "template_uid": "seçilen_şablon_uid",
+  "modifications": [
+    {{"name": "katman_adı", "text": "değer"}},
+    {{"name": "başka_katman", "text": "başka_değer"}}
+  ]
+}}
+
+Eğer bu bir tasarım isteği değilse, boş {{}} döndür."""
+
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{gemini_model}:generateContent?key={gemini_api_key}"
+    payload = {
+        "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+        "generationConfig": {"temperature": 0.3, "maxOutputTokens": 1024},
+    }
+
+    try:
+        data = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(
+            url, data=data, headers={"Content-Type": "application/json"}, method="POST"
+        )
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            result = json.loads(resp.read().decode("utf-8"))
+
+        gemini_text = result["candidates"][0]["content"]["parts"][0]["text"].strip()
+
+        # JSON parse et
+        # Gemini bazen ```json ... ``` ile sarabilir, temizle
+        if gemini_text.startswith("```"):
+            gemini_text = gemini_text.split("```")[1]
+            if gemini_text.startswith("json"):
+                gemini_text = gemini_text[4:].strip()
+
+        parsed = json.loads(gemini_text)
+        
+        # Boş veya geçersiz JSON ise None döndür
+        if not parsed or not parsed.get("template_uid"):
+            return None
+
+        return parsed
+
+    except (urllib.error.HTTPError, KeyError, json.JSONDecodeError, IndexError) as exc:
+        logger.error("Gemini tasarım parse hatası: %s", exc)
+        return None
 
 
 def format_template_list(templates: list[dict]) -> str:
