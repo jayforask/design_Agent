@@ -179,14 +179,17 @@ def generate_and_get_url(
 def build_modifications_from_prompt(user_prompt: str, template_info: dict) -> list[dict]:
     """
     Kullanıcının serbest metin promptunu şablon katmanlarına dönüştürür.
-    Şablondaki available_modifications listesini kullanarak akıllıca eşleştirir.
+
+    İki mod:
+    1. 'katman_adı: değer' formatında → eşleştirme ile
+    2. Serbest metin → tüm metin ilk text katmanına yazılır
 
     Args:
-        user_prompt: Kullanıcının tasarım isteği (örn: "başlık: Yaz İndirimi, renk: mavi")
+        user_prompt: Kullanıcının tasarım isteği
         template_info: get_template() çıktısı
 
     Returns:
-        modifications listesi
+        modifications listesi (en az 1 eleman)
     """
     available = template_info.get("available_modifications", [])
     modifications = []
@@ -194,22 +197,30 @@ def build_modifications_from_prompt(user_prompt: str, template_info: dict) -> li
     # Kullanıcı promptundan anahtar:değer çiftlerini parse et
     user_data = _parse_user_prompt(user_prompt)
 
-    for layer in available:
-        name = layer.get("name", "").lower()
-        layer_type = layer.get("type", "")
+    if user_data:
+        # 'anahtar: değer' formatı — katman adıyla eşleştir
+        for layer in available:
+            layer_name = layer.get("name", "")
+            layer_name_lower = layer_name.lower()
 
-        if layer_type == "text":
             matched_value = None
             for key, value in user_data.items():
-                if key in name or name in key:
+                # Tam eşleşme veya kısmi eşleşme
+                if key == layer_name_lower or key in layer_name_lower or layer_name_lower in key:
                     matched_value = value
                     break
 
             if matched_value:
-                modifications.append({
-                    "name": layer["name"],
-                    "text": matched_value,
-                })
+                mod = {"name": layer_name, "text": matched_value}
+                modifications.append(mod)
+
+    if not modifications and available:
+        # Eşleşme olmadıysa — tüm metni ilk text katmanına yaz
+        first_layer = available[0]
+        modifications.append({
+            "name": first_layer.get("name", ""),
+            "text": user_prompt.strip() if user_prompt.strip() else "DesignX",
+        })
 
     return modifications
 
@@ -233,6 +244,7 @@ def _parse_user_prompt(prompt: str) -> dict[str, str]:
 def format_template_list(templates: list[dict]) -> str:
     """
     Şablon listesini Telegram'da okunabilir formata çevirir.
+    Katman adlarını da gösterir.
     """
     if not templates:
         return "Hesabında henüz şablon yok. Bannerbear panelinden şablon ekle."
@@ -243,9 +255,18 @@ def format_template_list(templates: list[dict]) -> str:
         uid = t.get("uid", "?")
         width = t.get("width", "?")
         height = t.get("height", "?")
-        lines.append(f"{i}. *{name}*\n   UID: `{uid}` | {width}×{height}px")
+        lines.append(f"{i}. *{name}*")
+        lines.append(f"   UID: `{uid}` | {width}×{height}px")
+
+        # Katman adlarını listele
+        mods = t.get("available_modifications", [])
+        if mods:
+            layer_names = [m.get("name", "?") for m in mods]
+            lines.append(f"   Katmanlar: `{'`, `'.join(layer_names)}`")
+        lines.append("")
 
     if len(templates) > 10:
-        lines.append(f"\n_...ve {len(templates) - 10} şablon daha_")
+        lines.append(f"_...ve {len(templates) - 10} şablon daha_")
 
+    lines.append("💡 Kullanım: `/tasarim katman\\_adı: Değer`")
     return "\n".join(lines)
