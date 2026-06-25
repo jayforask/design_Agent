@@ -257,7 +257,7 @@ async def cmd_sablonlar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 
 async def cmd_tasarim(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """/tasarim <sablon_uid> <baslik: Metin, alt_baslik: Metin> — Görsel oluşturur ve gönderir."""
+    """/tasarim [sablon_uid] <metin veya baslik: Deger, alt_baslik: Deger> — Görsel oluşturur."""
     user = update.effective_user
     if not is_allowed(user.id):
         return
@@ -271,22 +271,54 @@ async def cmd_tasarim(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
 
     args = context.args
-    # İlk arg şablon UID, geri kalanı modifikasyon promptu
+
+    # İlk argüman Bannerbear UID formatına benziyorsa (harf+rakam, 10+ karakter) UID olarak al
+    # Benzimiyorsa tüm metin prompt, şablon listeden otomatik seç
+    def _looks_like_uid(s: str) -> bool:
+        return len(s) >= 10 and s.isalnum()
+
     if not args:
-        default_uid = config.BANNERBEAR_DEFAULT_TEMPLATE
-        if not default_uid:
+        # Hiç argüman yok — şablon listesi göster
+        try:
+            templates = bannerbear_agent.list_templates(config.BANNERBEAR_API_KEY)
+            if not templates:
+                await update.message.reply_text(
+                    "📋 Bannerbear hesabında şablon yok.\n"
+                    "https://app.bannerbear.com adresinden şablon oluştur."
+                )
+                return
+            # İlk şablonu varsayılan olarak kullan
+            template_uid = templates[0]["uid"]
+            prompt = ""
             await update.message.reply_text(
-                "📋 Kullanım:\n"
-                "`/tasarim <sablon_uid> baslik: Metin, alt_baslik: Alt Metin`\n\n"
-                "Mevcut şablonları görmek için /sablonlar komutunu kullan.",
+                f"💡 Şablon seçilmedi. Varsayılan şablon kullanılıyor: *{templates[0].get('name', template_uid)}*\n"
+                f"Örnek: `/tasarim baslik: Merhaba, alt\\_baslik: Dünya`",
                 parse_mode="Markdown",
             )
+        except Exception as exc:
+            logger.error("Bannerbear şablon listesi hatası: %s", exc)
+            await update.message.reply_text("⚠️ Şablon listesi alınamadı.")
             return
-        template_uid = default_uid
-        prompt = ""
-    else:
+    elif _looks_like_uid(args[0]):
+        # İlk arg UID gibi görünüyor
         template_uid = args[0]
         prompt = " ".join(args[1:])
+    else:
+        # İlk arg UID değil — tüm metni prompt yap, ilk şablonu kullan
+        prompt = " ".join(args)
+        try:
+            templates = bannerbear_agent.list_templates(config.BANNERBEAR_API_KEY)
+            if not templates:
+                await update.message.reply_text(
+                    "📋 Bannerbear hesabında şablon yok.\n"
+                    "https://app.bannerbear.com adresinden şablon oluştur."
+                )
+                return
+            template_uid = templates[0]["uid"]
+        except Exception as exc:
+            logger.error("Bannerbear şablon listesi hatası: %s", exc)
+            await update.message.reply_text("⚠️ Şablon listesi alınamadı.")
+            return
 
     await update.message.chat.send_action("upload_photo")
     await update.message.reply_text("🎨 Görsel oluşturuluyor, lütfen bekle...")
@@ -299,7 +331,6 @@ async def cmd_tasarim(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         if prompt:
             modifications = bannerbear_agent.build_modifications_from_prompt(prompt, template_info)
         else:
-            # Modifikasyon yoksa boş liste ile dene (varsayılan şablon değerleri kullanılır)
             modifications = []
 
         # Görseli oluştur ve URL'yi bekle
@@ -318,7 +349,7 @@ async def cmd_tasarim(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     except Exception as exc:
         logger.error("Bannerbear görsel oluşturma hatası: %s", exc)
         await update.message.reply_text(
-            f"⚠️ Görsel oluşturulamadı:\n`{exc}`\n\n"
+            f"⚠️ Görsel oluşturulamadı:\n`{str(exc)[:300]}`\n\n"
             "Şablon UID'sini `/sablonlar` ile kontrol et.",
             parse_mode="Markdown",
         )
