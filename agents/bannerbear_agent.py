@@ -5,11 +5,10 @@ Tasarım Ajanı - Bannerbear API Entegrasyonu
 Bannerbear API Docs: https://developers.bannerbear.com
 """
 
-import urllib.request
-import urllib.error
 import json
 import time
 import logging
+import httpx
 
 logger = logging.getLogger(__name__)
 
@@ -20,14 +19,25 @@ _BASE_URL = "https://api.bannerbear.com/v2"
 _POLL_INTERVAL = 3   # saniye
 _MAX_RETRIES = 15    # maksimum bekleme döngüsü (~45 saniye)
 
+# Cloudflare'i geçmek için gerçekçi tarayıcı header'ları
+_DEFAULT_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/125.0.0.0 Safari/537.36"
+    ),
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Connection": "keep-alive",
+}
 
-def _headers(api_key: str) -> dict:
-    return {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-        "User-Agent": "DesignX-Bot/1.0 (python-urllib)",
-        "Accept": "application/json",
-    }
+
+def _build_headers(api_key: str) -> dict:
+    headers = dict(_DEFAULT_HEADERS)
+    headers["Authorization"] = f"Bearer {api_key}"
+    headers["Content-Type"] = "application/json"
+    return headers
 
 
 def list_templates(api_key: str) -> list[dict]:
@@ -38,12 +48,13 @@ def list_templates(api_key: str) -> list[dict]:
         Şablon listesi (uid, name, width, height içerir)
     """
     url = f"{_BASE_URL}/templates"
-    req = urllib.request.Request(url, headers=_headers(api_key), method="GET")
-    try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            return json.loads(resp.read().decode("utf-8"))
-    except urllib.error.HTTPError as e:
-        raise RuntimeError(f"Bannerbear şablon listesi hatası {e.code}: {e.read().decode()}") from e
+    with httpx.Client(timeout=15, follow_redirects=True) as client:
+        resp = client.get(url, headers=_build_headers(api_key))
+        if resp.status_code != 200:
+            raise RuntimeError(
+                f"Bannerbear şablon listesi hatası {resp.status_code}: {resp.text}"
+            )
+        return resp.json()
 
 
 def get_template(api_key: str, template_uid: str) -> dict:
@@ -51,12 +62,13 @@ def get_template(api_key: str, template_uid: str) -> dict:
     Belirli bir şablonun detaylarını (available_modifications) getirir.
     """
     url = f"{_BASE_URL}/templates/{template_uid}"
-    req = urllib.request.Request(url, headers=_headers(api_key), method="GET")
-    try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            return json.loads(resp.read().decode("utf-8"))
-    except urllib.error.HTTPError as e:
-        raise RuntimeError(f"Bannerbear şablon detay hatası {e.code}: {e.read().decode()}") from e
+    with httpx.Client(timeout=15, follow_redirects=True) as client:
+        resp = client.get(url, headers=_build_headers(api_key))
+        if resp.status_code != 200:
+            raise RuntimeError(
+                f"Bannerbear şablon detay hatası {resp.status_code}: {resp.text}"
+            )
+        return resp.json()
 
 
 def create_image(
@@ -85,13 +97,13 @@ def create_image(
     if webhook_url:
         payload["webhook_url"] = webhook_url
 
-    data = json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(url, data=data, headers=_headers(api_key), method="POST")
-    try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            return json.loads(resp.read().decode("utf-8"))
-    except urllib.error.HTTPError as e:
-        raise RuntimeError(f"Bannerbear görsel oluşturma hatası {e.code}: {e.read().decode()}") from e
+    with httpx.Client(timeout=30, follow_redirects=True) as client:
+        resp = client.post(url, headers=_build_headers(api_key), json=payload)
+        if resp.status_code not in (200, 201):
+            raise RuntimeError(
+                f"Bannerbear görsel oluşturma hatası {resp.status_code}: {resp.text}"
+            )
+        return resp.json()
 
 
 def wait_for_image(api_key: str, image_uid: str) -> str:
@@ -109,30 +121,37 @@ def wait_for_image(api_key: str, image_uid: str) -> str:
         RuntimeError: Görsel belirli sürede tamamlanamazsa
     """
     url = f"{_BASE_URL}/images/{image_uid}"
-    req = urllib.request.Request(url, headers=_headers(api_key), method="GET")
 
-    for attempt in range(_MAX_RETRIES):
-        try:
-            with urllib.request.urlopen(req, timeout=15) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
-        except urllib.error.HTTPError as e:
-            raise RuntimeError(f"Bannerbear görsel sorgulama hatası {e.code}: {e.read().decode()}") from e
+    with httpx.Client(timeout=15, follow_redirects=True) as client:
+        for attempt in range(_MAX_RETRIES):
+            resp = client.get(url, headers=_build_headers(api_key))
+            if resp.status_code != 200:
+                raise RuntimeError(
+                    f"Bannerbear görsel sorgulama hatası {resp.status_code}: {resp.text}"
+                )
+            data = resp.json()
+            status = data.get("status", "pending")
+            logger.info(
+                "Bannerbear görsel durumu [%s]: %s (deneme %d)",
+                image_uid, status, attempt + 1
+            )
 
-        status = data.get("status", "pending")
-        logger.info("Bannerbear görsel durumu [%s]: %s (deneme %d)", image_uid, status, attempt + 1)
+            if status == "completed":
+                image_url = data.get("image_url_png") or data.get("image_url")
+                if not image_url:
+                    raise RuntimeError(
+                        "Bannerbear görsel tamamlandı fakat URL bulunamadı."
+                    )
+                return image_url
 
-        if status == "completed":
-            image_url = data.get("image_url_png") or data.get("image_url")
-            if not image_url:
-                raise RuntimeError("Bannerbear görsel tamamlandı fakat URL bulunamadı.")
-            return image_url
+            if status == "failed":
+                raise RuntimeError(f"Bannerbear görsel oluşturma başarısız: {data}")
 
-        if status == "failed":
-            raise RuntimeError(f"Bannerbear görsel oluşturma başarısız: {data}")
+            time.sleep(_POLL_INTERVAL)
 
-        time.sleep(_POLL_INTERVAL)
-
-    raise RuntimeError(f"Bannerbear görsel {_MAX_RETRIES * _POLL_INTERVAL} saniye içinde tamamlanamadı.")
+    raise RuntimeError(
+        f"Bannerbear görsel {_MAX_RETRIES * _POLL_INTERVAL} saniye içinde tamamlanamadı."
+    )
 
 
 def generate_and_get_url(
@@ -184,17 +203,15 @@ def build_modifications_from_prompt(user_prompt: str, template_info: dict) -> li
 
     for layer in available:
         name = layer.get("name", "").lower()
-        layer_type = layer.get("type", "")  # text, image vb.
+        layer_type = layer.get("type", "")
 
         if layer_type == "text":
-            # Eşleşen anahtar kelime ara
             matched_value = None
             for key, value in user_data.items():
                 if key in name or name in key:
                     matched_value = value
                     break
 
-            # Eşleşme yoksa varsayılan veya boş bırak
             if matched_value:
                 modifications.append({
                     "name": layer["name"],
@@ -210,7 +227,6 @@ def _parse_user_prompt(prompt: str) -> dict[str, str]:
     {'başlık': 'Yaz İndirimi', 'alt yazı': '%50 indirim'} dict'ine çevirir.
     """
     result = {}
-    # Virgül veya yeni satırla ayrılmış 'anahtar: değer' çiftleri
     for part in prompt.replace("\n", ",").split(","):
         if ":" in part:
             key, _, value = part.partition(":")
@@ -229,7 +245,7 @@ def format_template_list(templates: list[dict]) -> str:
         return "Hesabında henüz şablon yok. Bannerbear panelinden şablon ekle."
 
     lines = ["📋 *Mevcut Bannerbear Şablonları:*\n"]
-    for i, t in enumerate(templates[:10], 1):  # İlk 10'u göster
+    for i, t in enumerate(templates[:10], 1):
         name = t.get("name", "İsimsiz")
         uid = t.get("uid", "?")
         width = t.get("width", "?")
